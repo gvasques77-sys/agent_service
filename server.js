@@ -47,144 +47,374 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/process', async (req, res) => {
-  const started = Date.now();
+const started = Date.now();
+const DEBUG = process.env.DEBUG === 'true';
+const MAX_STEPS = Number(process.env.AGENT_MAX_STEPS || 2);
+const GLOBAL_TIMEOUT_MS = Number(process.env.AGENT_TIMEOUT_MS || 12000);
 
-  const parsed = EnvelopeSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: 'invalid_envelope',
-      details: parsed.error.flatten(),
-    });
-  }
-  const envelope = parsed.data;
+const parsed = EnvelopeSchema.safeParse(req.body);
+if (!parsed.success) {
+return res.status(400).json({
+error: 'invalid_envelope',
+details: parsed.error.flatten(),
+});
+}
 
-  try {
-    // 1) Buscar regras da clÃ­nica (MVP sem agenda)
-    const { data: settings, error: settingsErr } = await supabase
-      .from('clinic_settings')
-      .select('*')
-      .eq('clinic_id', envelope.clinic_id)
-      .maybeSingle();
+const envelope = parsed.data;
 
-    if (settingsErr) throw settingsErr;
+// Timeout global (evita worker travar)
+const controller = new AbortController();
+const timeout = setTimeout(() => controller.abort(), GLOBAL_TIMEOUT_MS);
 
-    const clinicRules = settings ?? {
-      clinic_id: envelope.clinic_id,
-      timezone: 'America/Cuiaba',
-      allow_prices: false,
-      business_hours: {
-        mon_fri: '08:00-12:00,13:00-18:00',
-        sat: '08:00-12:00',
-        sun: 'closed',
-      },
-      policies_text:
-        'Se allow_prices=false, nÃ£o informar preÃ§os. Focar em triagem e coleta de dados para agendamento.',
-    };
+// helper: safe JSON.parse
+const safeJsonParse = (s) => {
+try {
+return JSON.parse(s);
+} catch {
+return null;
+}
+};
 
-    // 2) Tool Ãºnica (MVP): extrair intenÃ§Ã£o e dados
-    const tools = [
-      {
-        type: 'function',
-        name: 'extract_intent',
-        description:
-          'Extrai intenÃ§Ã£o e dados estruturados de uma mensagem do paciente para secretÃ¡ria de clÃ­nica.',
-        parameters: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            intent: {
-              type: 'string',
-              enum: ['schedule', 'reschedule', 'cancel', 'confirm', 'info', 'prices', 'other'],
-            },
-            patient_name: { type: 'string' },
-            specialty: { type: 'string' },
-            preferred_date: { type: 'string' },
-            preferred_time: { type: 'string' },
-            missing_fields: {
-              type: 'array',
-              items: { type: 'string' },
-            },
-            confidence: { type: 'number', minimum: 0, maximum: 1 },
-          },
-          required: ['intent', 'missing_fields', 'confidence'],
-        },
-      },
-    ];
+try {
+// ======================================================
+// 1) BUSCAR REGRAS DA CLÍNICA (SEM HARDCODE)
+// ======================================================
+const { data: settings, error: settingsErr } = await supabase
+.from('clinic_settings')
+.select('*')
+.eq('clinic_id', envelope.clinic_id)
+.maybeSingle();
 
-    // 3) Chamar OpenAI (tool calling)
-    const response = await openai.responses.create({
-      model: 'gpt-5.2',
-      instructions: [
-        'VocÃª Ã© uma secretÃ¡ria inteligente de clÃ­nica no WhatsApp.',
-        'Seja humana, objetiva e eficiente. Evite perguntas desnecessÃ¡rias.',
-        'NÃ£o invente agenda (nÃ£o existe agenda no sistema).',
-        `Regras dinÃ¢micas: allow_prices=${clinicRules.allow_prices}; business_hours=${JSON.stringify(clinicRules.business_hours)}.`,
-        `Politicas: ${String(clinicRules.policies_text || '')}`,
-        'Se o paciente pedir preÃ§os e allow_prices=false, negue com educaÃ§Ã£o e ofereÃ§a agendar avaliaÃ§Ã£o.',
-        'Responda em pt-BR.'
-      ].join('\\n'),
-      input: envelope.message_text,
-      tools,
-      tool_choice: { type: 'function', name: 'extract_intent' },
-    });
+if (settingsErr) throw settingsErr;
 
-    const toolCall = response.output?.find((o) => o.type === 'tool_call');
-    const extracted = toolCall?.arguments ? JSON.parse(toolCall.arguments) : null;
+const clinicRules = settings ?? {
+clinic_id: envelope.clinic_id,
+allow_prices: false,
+timezone: 'America/Cuiaba',
+business_hours: {},
+policies_text: '',
+};
 
-    if (!extracted) {
-      return res.json({
-        correlation_id: envelope.correlation_id,
-        final_message:
-          'Entendi. Para eu te ajudar direitinho, vocÃª pode me dizer seu nome e se vocÃª quer marcar, remarcar ou cancelar uma consulta?',
-        actions: [],
-        debug: { note: 'no_tool_call', latency_ms: Date.now() - started },
-      });
-    }
+// ======================================================
+// 2) RETRIEVAL SIMPLES DA KB (RAG básico)
+// (MVP: pega até 8 itens da clinic_kb; depois você melhora com busca)
+// ======================================================
+const { data: kbRows, error: kbErr } = await supabase
+.from('clinic_kb')
+.select('title, content')
+.eq('clinic_id', envelope.clinic_id)
+.limit(8);
 
-    // 4) Regra de preÃ§o
-    if (extracted.intent === 'prices' && clinicRules.allow_prices === false) {
-      return res.json({
-        correlation_id: envelope.correlation_id,
-        final_message:
-          'Sobre valores: por aqui a gente nÃ£o informa preÃ§os. Mas posso te ajudar a agendar uma avaliaÃ§Ã£o â€” me diga seu nome e qual melhor dia/horÃ¡rio. ðŸ™‚',
-        actions: [{ type: 'log', event: 'prices_blocked', extracted }],
-        debug: { extracted, latency_ms: Date.now() - started },
-      });
-    }
+if (kbErr) throw kbErr;
 
-    // 5) Pedir o que falta (poupando etapas)
-    const missing = extracted.missing_fields ?? [];
-    const askPieces = [];
+const kbContext = (kbRows ?? [])
+.map((r) => `• ${r.title}: ${r.content}`)
+.join('\n');
 
-    // OBS: o modelo pode nÃ£o preencher missing_fields perfeitamente no comeÃ§o.
-    // vocÃª vai ajustar depois com testes.
-    if (missing.includes('patient_name')) askPieces.push('seu nome');
-    if (missing.includes('specialty')) askPieces.push('a especialidade (ou o motivo da consulta)');
-    if (missing.includes('preferred_date')) askPieces.push('o melhor dia');
-    if (missing.includes('preferred_time')) askPieces.push('o melhor horÃ¡rio (manhÃ£/tarde/noite)');
+// ======================================================
+// 3) TOOLS — schemas rígidos (additionalProperties:false)
+// ======================================================
 
-    const ask = askPieces.length
-      ? `Só me diga ${askPieces.join(', ')} e eu já sigo com você.`
-      : 'Perfeito. Me diga seu nome e o melhor dia/horÃ¡rio e eu jÃ¡ sigo com vocÃª.';
+const tools = [
+{
+type: 'function',
+name: 'extract_intent',
+strict: true,
+description:
+'Classifica intenção (2 níveis) e extrai slots estruturados. Não escreve resposta ao usuário.',
+parameters: {
+type: 'object',
+additionalProperties: false,
+properties: {
+intent_group: {
+type: 'string',
+enum: [
+'scheduling',
+'procedures',
+'clinical',
+'billing',
+'logistics',
+'results',
+'other',
+],
+},
+intent: { type: 'string' },
 
-    return res.json({
-      correlation_id: envelope.correlation_id,
-      final_message: ask,
-      actions: [
-        { type: 'upsert_patient', patient_name: extracted.patient_name ?? null },
-        { type: 'log', event: 'intent_extracted', extracted },
-      ],
-      debug: { extracted, latency_ms: Date.now() - started },
-    });
-  } catch (err) {
-    log.error({ err }, 'agent_process_error');
-    return res.status(500).json({
-      correlation_id: envelope.correlation_id,
-      final_message:
-        'Tive uma instabilidade aqui. Pode repetir sua mensagem em 1 minuto, por favor? ðŸ™',
-      actions: [{ type: 'log', event: 'agent_error', err: String(err?.message ?? err) }],
-    });
-  }
+// Slots explícitos (união dos principais por vertical)
+slots: {
+type: 'object',
+additionalProperties: false,
+properties: {
+// comuns
+patient_name: { type: 'string' },
+specialty_or_reason: { type: 'string' },
+preferred_date_text: { type: 'string' },
+preferred_time_text: { type: 'string' },
+time_window: {
+type: 'string',
+enum: [
+'morning',
+'afternoon',
+'evening',
+'after_18',
+'before_10',
+'any',
+'unknown',
+],
+},
+doctor_preference: { type: 'string' },
+unit_preference: { type: 'string' },
+
+// estética/procedimentos
+procedure_name: { type: 'string' },
+procedure_area: { type: 'string' },
+goal: { type: 'string' },
+price_request: { type: 'boolean' },
+
+// clínica geral
+symptom_summary: { type: 'string' },
+duration: { type: 'string' },
+severity: { type: 'string' },
+red_flags_present: {
+type: 'array',
+items: { type: 'string' },
+},
+comorbidities: { type: 'string' },
+current_meds: { type: 'string' },
+requested_care_type: { type: 'string' },
+
+// exames/resultados
+test_type: { type: 'string' },
+result_status: { type: 'string' },
+collection_date: { type: 'string' },
+fasting_question: { type: 'boolean' },
+abnormal_values_mentioned: { type: 'string' },
+next_step_request: { type: 'string' },
+},
+required: [],
+},
+
+missing_fields: {
+type: 'array',
+items: { type: 'string' },
+},
+
+confidence: { type: 'number', minimum: 0, maximum: 1 },
+},
+required: ['intent_group', 'intent', 'confidence'],
+},
+},
+
+{
+type: 'function',
+name: 'decide_next_action',
+strict: true,
+description:
+'Decide o próximo passo (policy), com base no extracted + regras + KB. Retorna mensagem curta e ações sugeridas.',
+parameters: {
+type: 'object',
+additionalProperties: false,
+properties: {
+decision_type: {
+type: 'string',
+enum: ['ask_missing', 'block_price', 'handoff', 'proceed'],
+},
+message: { type: 'string' },
+actions: {
+type: 'array',
+items: {
+type: 'object',
+additionalProperties: false,
+properties: {
+type: { type: 'string' },
+payload: { type: 'object' },
+},
+required: ['type'],
+},
+},
+confidence: { type: 'number', minimum: 0, maximum: 1 },
+},
+required: ['decision_type', 'message'],
+},
+},
+];
+
+// ======================================================
+// 4) FEW-SHOTS (curto, só para calibrar)
+// ======================================================
+const fewShots = `
+Exemplo 1:
+Usuário: "Quero marcar consulta amanhã de manhã"
+extract_intent => {"intent_group":"scheduling","intent":"schedule_new","slots":{"time_window":"morning","preferred_date_text":"amanhã"},"missing_fields":["patient_name","specialty_or_reason"],"confidence":0.92}
+
+Exemplo 2:
+Usuário: "Quanto custa botox?"
+extract_intent => {"intent_group":"billing","intent":"procedure_pricing_request","slots":{"procedure_name":"botox","price_request":true},"missing_fields":[],"confidence":0.95}
+`.trim();
+
+// ======================================================
+// 5) LOOP CONTROLADO (máx 2 steps por padrão)
+// ======================================================
+let step = 0;
+let extracted = null;
+let decided = null;
+
+// STEP 0: extract_intent (FORÇADO)
+if (step < MAX_STEPS) {
+const extraction = await openai.responses.create({
+model: 'gpt-5.2',
+instructions: [
+'Você é um classificador/estruturador. Sua única saída é chamar a tool extract_intent.',
+'Não gere texto para o usuário.',
+'Não invente dados. Se incerto, mantenha confidence baixa.',
+'Taxonomia: intent_group + intent.',
+'Use os slots definidos.',
+'Contexto KB (referência de domínio):',
+kbContext || 'SEM KB',
+'',
+fewShots,
+].join('\n'),
+input: envelope.message_text,
+tools: [tools[0]],
+tool_choice: { type: 'function', name: 'extract_intent' },
+signal: controller.signal,
+});
+
+const call = extraction.output?.find(
+(o) => o.type === 'tool_call' && o.name === 'extract_intent'
+);
+
+const parsedArgs = call?.arguments ? safeJsonParse(call.arguments) : null;
+
+if (!parsedArgs) {
+return res.json({
+correlation_id: envelope.correlation_id,
+final_message:
+'Entendi. Só para eu te ajudar: você quer marcar, remarcar ou cancelar uma consulta?',
+actions: [],
+debug: DEBUG ? { note: 'no_extract_tool_call' } : undefined,
+});
+}
+
+extracted = parsedArgs;
+step++;
+}
+
+// ======================================================
+// 6) CONFIDENCE GUARD (backend decide quando pedir clarificação)
+// ======================================================
+if (!extracted || extracted.confidence < 0.6) {
+clearTimeout(timeout);
+return res.json({
+correlation_id: envelope.correlation_id,
+final_message:
+'Só para confirmar: você quer marcar, remarcar, cancelar ou tirar uma dúvida?',
+actions: [],
+debug: DEBUG ? { extracted } : undefined,
+});
+}
+
+// ======================================================
+// 7) STEP 1: decide_next_action (FORÇADO)
+// ======================================================
+if (step < MAX_STEPS) {
+const decision = await openai.responses.create({
+model: 'gpt-5.2',
+instructions: [
+'Você decide o próximo passo (policy). Sua única saída é chamar decide_next_action.',
+'Não invente agenda. Não confirme horário.',
+`Regra crítica: allow_prices=${clinicRules.allow_prices}.`,
+'Se o paciente pedir preço e allow_prices=false: decision_type=block_price.',
+'Se faltar dado essencial: decision_type=ask_missing com pergunta mínima.',
+'Use KB quando relevante (sem inventar).',
+'Responda em pt-BR e mensagem curta.',
+'KB:',
+kbContext || 'SEM KB',
+].join('\n'),
+input: JSON.stringify({ extracted }),
+tools: [tools[1]],
+tool_choice: { type: 'function', name: 'decide_next_action' },
+signal: controller.signal,
+});
+
+const call = decision.output?.find(
+(o) => o.type === 'tool_call' && o.name === 'decide_next_action'
+);
+
+const parsedArgs = call?.arguments ? safeJsonParse(call.arguments) : null;
+
+if (!parsedArgs) {
+decided = {
+decision_type: 'ask_missing',
+message:
+'Perfeito. Me diga seu nome completo e o melhor dia/horário (manhã/tarde/noite).',
+actions: [{ type: 'log' }],
+};
+} else {
+decided = parsedArgs;
+}
+
+step++;
+}
+
+// ======================================================
+// 8) VALIDAÇÃO BACKEND (NÃO deixar o modelo mandar sem validação)
+// ======================================================
+if (
+extracted.intent_group === 'billing' &&
+clinicRules.allow_prices === false
+) {
+decided = {
+decision_type: 'block_price',
+message:
+'Por aqui não informamos valores. Posso agendar uma avaliação — me diga seu nome e o melhor dia/horário 🙂',
+actions: [{ type: 'log' }],
+confidence: 1,
+};
+}
+
+// ======================================================
+// 9) LOG ESTRUTURADO (agent_logs)
+// ======================================================
+// Falha de log NÃO deve quebrar a resposta
+try {
+await supabase.from('agent_logs').insert({
+clinic_id: envelope.clinic_id,
+correlation_id: envelope.correlation_id,
+intent_group: extracted.intent_group,
+intent: extracted.intent,
+confidence: extracted.confidence,
+decision_type: decided?.decision_type || null,
+latency_ms: Date.now() - started,
+});
+} catch (e) {
+// opcional: log local (pino)
+log.warn({ err: String(e) }, 'agent_logs_insert_failed');
+}
+
+clearTimeout(timeout);
+
+return res.json({
+correlation_id: envelope.correlation_id,
+final_message: decided.message,
+actions: decided.actions ?? [],
+debug: DEBUG
+? { extracted, decided, kb_hits: (kbRows ?? []).length, latency_ms: Date.now() - started }
+: undefined,
+});
+} catch (err) {
+clearTimeout(timeout);
+
+const isTimeout = String(err?.name || '').toLowerCase().includes('abort');
+
+return res.status(500).json({
+correlation_id: envelope.correlation_id,
+final_message: isTimeout
+? 'Demorei um pouco para responder. Pode repetir sua mensagem, por favor? 🙏'
+: 'Tive uma instabilidade agora. Pode repetir sua mensagem em 1 minuto?',
+actions: [{ type: 'log', payload: { event: 'agent_error' } }],
+});
+}
 });
 
 app.listen(PORT, () => {
