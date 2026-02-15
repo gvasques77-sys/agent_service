@@ -17,6 +17,7 @@ const log = pino({
 // ENV
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -86,6 +87,12 @@ const { data: settings, error: settingsErr } = await supabase
 .maybeSingle();
 
 if (settingsErr) throw settingsErr;
+if (!settings) {
+log.warn(
+{ clinic_id: envelope.clinic_id, correlation_id: envelope.correlation_id },
+'clinic_settings_not_found_using_defaults'
+);
+}
 
 const clinicRules = settings ?? {
 clinic_id: envelope.clinic_id,
@@ -262,7 +269,7 @@ let decided = null;
 // STEP 0: extract_intent (FORÇADO)
 if (step < MAX_STEPS) {
 const extraction = await openai.responses.create({
-model: 'gpt-5.2',
+model: OPENAI_MODEL,
 instructions: [
 'Você é um classificador/estruturador. Sua única saída é chamar a tool extract_intent.',
 'Não gere texto para o usuário.',
@@ -319,7 +326,7 @@ debug: DEBUG ? { extracted } : undefined,
 // ======================================================
 if (step < MAX_STEPS) {
 const decision = await openai.responses.create({
-model: 'gpt-5.2',
+model: OPENAI_MODEL,
 instructions: [
 'Você decide o próximo passo (policy). Sua única saída é chamar decide_next_action.',
 'Não invente agenda. Não confirme horário.',
@@ -405,14 +412,29 @@ debug: DEBUG
 } catch (err) {
 clearTimeout(timeout);
 
+const errName = err?.name || 'UnknownError';
+const errMessage = err?.message || String(err);
+log.error(
+{
+err_name: errName,
+err_message: errMessage,
+correlation_id: envelope.correlation_id,
+clinic_id: envelope.clinic_id,
+},
+'process_error'
+);
+
 const isTimeout = String(err?.name || '').toLowerCase().includes('abort');
 
-return res.status(500).json({
+return res.status(200).json({
 correlation_id: envelope.correlation_id,
 final_message: isTimeout
 ? 'Demorei um pouco para responder. Pode repetir sua mensagem, por favor? 🙏'
 : 'Tive uma instabilidade agora. Pode repetir sua mensagem em 1 minuto?',
 actions: [{ type: 'log', payload: { event: 'agent_error' } }],
+debug: DEBUG
+? { error_message: errMessage, error_name: errName }
+: undefined,
 });
 }
 });
